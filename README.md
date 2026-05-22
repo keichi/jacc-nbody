@@ -1,77 +1,81 @@
-# JACC.jl N体ベンチマーク
+# JACC.jl N-body Benchmark
 
-[JACC.jl](https://github.com/JuliaGPU/JACC.jl) を用いた、N体問題（直接総当たり法）の
-力カーネルベンチマーク。**単一ソースのまま** CPU スレッド / CUDA / AMDGPU / Metal /
-oneAPI のいずれのバックエンドでも動作する。
+A force-kernel benchmark for the N-body problem (direct all-pairs method)
+using [JACC.jl](https://github.com/JuliaGPU/JACC.jl). It runs on any of the
+CPU threads / CUDA / AMDGPU / Metal / oneAPI backends **from a single source**.
 
-カーネルは [ymiki-repo/nbody](https://github.com/ymiki-repo/nbody) の
-2次 leapfrog・直接総当たり (direct all-pairs, O(N²)) の加速度計算 `calc_acc` を参考にした。
-本ベンチマークは同リポジトリの `BENCHMARK_MODE` に倣い、**力（加速度）計算カーネル
-単体の性能**を、N を変えながら測定する。
+The kernel is based on the `calc_acc` acceleration computation of the
+2nd-order leapfrog, direct all-pairs (O(N²)) scheme from
+[ymiki-repo/nbody](https://github.com/ymiki-repo/nbody). Following that
+repository's `BENCHMARK_MODE`, this benchmark measures the **performance of
+the force (acceleration) kernel alone** while varying N.
 
-## アルゴリズム
+## Algorithm
 
-- 加速度: `a_i = Σ_j m_j (r_j - r_i) / (r_ji² + ε²)^{3/2}`、重力定数 `G = 1`
-- Plummer ソフトニング: `ε = 1/64`
-- 初期条件: 一様球（半径 1、総質量 1、等質量粒子）
-- 相互作用あたり **24 FLOP**（reciprocal-sqrt を 4 FLOP と数える）
-- データ配置: SoA（位置 `x,y,z`、質量 `m`、加速度 `ax,ay,az` を別配列）
+- Acceleration: `a_i = Σ_j m_j (r_j - r_i) / (r_ji² + ε²)^{3/2}`, gravitational constant `G = 1`
+- Plummer softening: `ε = 1/64`
+- Initial conditions: uniform sphere (radius 1, total mass 1, equal-mass particles)
+- **24 FLOP** per interaction (the reciprocal-sqrt is counted as 4 FLOP)
+- Data layout: SoA (positions `x,y,z`, mass `m`, accelerations `ax,ay,az` in separate arrays)
 
-## 必要環境
+## Requirements
 
-- Julia 1.11 以降
+- Julia 1.11 or later
 
-## セットアップ
+## Setup
 
 ```sh
 julia --project -e 'using Pkg; Pkg.instantiate()'
 ```
 
-## 実行
+## Running
 
-CPU スレッドバックエンド（既定。追加インストール不要）:
+CPU threads backend (default; no extra installation required):
 
 ```sh
-# 既定スイープ: N = 1024 .. 2^20、11 点
+# Default sweep: N = 1024 .. 2^20, 11 points
 julia --project -t auto nbody_jacc.jl
 
-# 引数で N_min N_max N_bins を指定
+# Specify N_min N_max N_bins via arguments
 julia --project -t auto nbody_jacc.jl 1024 2097152 12
 ```
 
-倍精度（`Float64`）に切り替え（既定は `Float32`）:
+Switch to double precision (`Float64`; the default is `Float32`):
 
 ```sh
 JACC_NBODY_FP=64 julia --project -t auto nbody_jacc.jl
 ```
 
-## GPU バックエンドで実行
+## Running on GPU backends
 
-一度だけバックエンドを設定すると `LocalPreferences.toml` が生成される。
-以降はスクリプトを無改変で実行できる。
+Setting the backend once generates a `LocalPreferences.toml`.
+After that, the script can be run unchanged.
 
 ```sh
-# 例: CUDA。"amdgpu" / "metal" / "oneapi" も同様
+# Example: CUDA. "amdgpu" / "metal" / "oneapi" work the same way
 julia --project -e 'import JACC; JACC.set_backend("cuda")'
 julia --project nbody_jacc.jl
 ```
 
-CPU スレッドへ戻す場合:
+To switch back to CPU threads:
 
 ```sh
 julia --project -e 'import JACC; JACC.set_backend("threads")'
 ```
 
-## 出力
+## Output
 
-- 実行時に小規模 (N=256) の正当性チェックを行い、ホスト側の素朴な逐次実装と
-  相対 L2 誤差を比較する。
-- GPU バックエンドでは起動時に threadgroup サイズ（`{64,128,256,512,1024}`）を
-  軽量オートチューンし、最速の値をスイープ全体に採用する（ヘッダの
-  `threadgroup size` 行に表示）。CPU スレッドバックエンドではオートチューンを
-  skip し、JACC 既定の起動設定を用いる（`auto (JACC default)` と表示）。
-- N スイープの各点で、最小計測時間 (0.5 s) に達するまで反復回数を自動調整し、
-  `interactions/s` と `GFLOP/s` を表形式で出力する。
+- At runtime, a small-scale (N=256) correctness check is performed,
+  comparing against a naive sequential host-side implementation by
+  relative L2 error.
+- On GPU backends, the threadgroup size (`{64,128,256,512,1024}`) is
+  lightly auto-tuned at startup, and the fastest value is used for the
+  entire sweep (shown in the `threadgroup size` line of the header). On
+  the CPU threads backend, auto-tuning is skipped and JACC's default
+  launch configuration is used (shown as `auto (JACC default)`).
+- At each point of the N sweep, the iteration count is automatically
+  adjusted until the minimum measurement time (0.5 s) is reached, and
+  `interactions/s` and `GFLOP/s` are printed in tabular form.
 
 ```
   threadgroup size   : 128
@@ -82,9 +86,9 @@ julia --project -e 'import JACC; JACC.set_backend("threads")'
 peak performance: 54.217 GFLOP/s  (24 FLOP per interaction)
 ```
 
-## ファイル
+## Files
 
-| ファイル | 内容 |
+| File | Contents |
 |---|---|
-| `nbody_jacc.jl` | ベンチマーク本体（カーネル・初期条件・正当性チェック・スイープ） |
-| `Project.toml` / `Manifest.toml` | 依存パッケージ（`JACC`） |
+| `nbody_jacc.jl` | The benchmark itself (kernel, initial conditions, correctness check, sweep) |
+| `Project.toml` / `Manifest.toml` | Dependencies (`JACC`) |
