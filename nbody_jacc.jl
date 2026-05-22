@@ -15,7 +15,7 @@ import JACC
 JACC.@init_backend
 
 using Printf
-using Base.Cartesian: @nexprs
+using Base.Cartesian: @nexprs, @ntuple
 
 # Floating-point type: Float32 (default) or Float64 via JACC_NBODY_FP=64
 const FP = get(ENV, "JACC_NBODY_FP", "32") == "64" ? Float64 : Float32
@@ -28,26 +28,27 @@ const FLOPS_PER_INTERACTION = 24.0
 # a_i = sum_j  m_j * (r_j - r_i) / (r_ji^2 + eps^2)^(3/2),  with G = 1.
 # The j == i term is kept (Plummer softening keeps it finite), matching the
 # reference's N_pairs = N^2 accounting.
-# The j loop is unrolled 4x with independent partial accumulators (suffixes
-# _1.._4): consecutive interactions become independent, exposing the
+# The j loop is unrolled 8x with independent partial accumulators (suffixes
+# _1.._8): consecutive interactions become independent, exposing the
 # instruction-level parallelism the GPU needs to overlap reciprocal-sqrt
 # latency. @fastmath fuses 1/sqrt into a fast reciprocal-sqrt and drops the
 # (slow, no hardware unit on Apple GPUs) division; Plummer softening keeps
 # r2 >= eps2 > 0 so no NaN/Inf can arise. Portable across all JACC backends.
-const UNROLL = 4
+# 8x was picked by tune_unroll.jl: peak GFLOP/s on Metal at N=32768, with a
+# sharp drop beyond (register pressure). Re-run that script to retune -- and
+# keep the literal 8 in `@nexprs` and `N % 8` below in sync if you do.
 
 function calc_acc!(i, x, y, z, m, ax, ay, az, eps2, N)
     T = eltype(ax)
     @inbounds xi = x[i]
     @inbounds yi = y[i]
     @inbounds zi = z[i]
-    @nexprs 4 u -> axi_u = zero(T)
-    @nexprs 4 u -> ayi_u = zero(T)
-    @nexprs 4 u -> azi_u = zero(T)
-    Nround = N - (N % UNROLL)
-    j = 1
-    @inbounds @fastmath while j <= Nround
-        @nexprs 4 u -> begin
+    @nexprs 8 u -> axi_u = zero(T)
+    @nexprs 8 u -> ayi_u = zero(T)
+    @nexprs 8 u -> azi_u = zero(T)
+    Nround = N - (N % 8)
+    @inbounds @fastmath for j in 1:8:Nround
+        @nexprs 8 u -> begin
             dx_u = x[j + u - 1] - xi
             dy_u = y[j + u - 1] - yi
             dz_u = z[j + u - 1] - zi
@@ -58,10 +59,9 @@ function calc_acc!(i, x, y, z, m, ax, ay, az, eps2, N)
             ayi_u += alp_u * dy_u
             azi_u += alp_u * dz_u
         end
-        j += UNROLL
     end
-    # Tail for N not divisible by UNROLL.
-    @inbounds @fastmath while j <= N
+    # Tail for N not divisible by 8.
+    @inbounds @fastmath for j in (Nround + 1):N
         dx = x[j] - xi
         dy = y[j] - yi
         dz = z[j] - zi
@@ -71,11 +71,10 @@ function calc_acc!(i, x, y, z, m, ax, ay, az, eps2, N)
         axi_1 += alp * dx
         ayi_1 += alp * dy
         azi_1 += alp * dz
-        j += 1
     end
-    @inbounds ax[i] = (axi_1 + axi_2) + (axi_3 + axi_4)
-    @inbounds ay[i] = (ayi_1 + ayi_2) + (ayi_3 + ayi_4)
-    @inbounds az[i] = (azi_1 + azi_2) + (azi_3 + azi_4)
+    @inbounds ax[i] = sum(@ntuple 8 axi)
+    @inbounds ay[i] = sum(@ntuple 8 ayi)
+    @inbounds az[i] = sum(@ntuple 8 azi)
     return nothing
 end
 
