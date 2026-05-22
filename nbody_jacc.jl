@@ -15,6 +15,7 @@ import JACC
 JACC.@init_backend
 
 using Printf
+using Base.Cartesian: @nexprs
 
 # Floating-point type: Float32 (default) or Float64 via JACC_NBODY_FP=64
 const FP = get(ENV, "JACC_NBODY_FP", "32") == "64" ? Float64 : Float32
@@ -27,33 +28,66 @@ const FLOPS_PER_INTERACTION = 24.0
 # a_i = sum_j  m_j * (r_j - r_i) / (r_ji^2 + eps^2)^(3/2),  with G = 1.
 # The j == i term is kept (Plummer softening keeps it finite), matching the
 # reference's N_pairs = N^2 accounting.
+# The j loop is unrolled 4x with independent partial accumulators (suffixes
+# _1.._4): consecutive interactions become independent, exposing the
+# instruction-level parallelism the GPU needs to overlap reciprocal-sqrt
+# latency. @fastmath fuses 1/sqrt into a fast reciprocal-sqrt and drops the
+# (slow, no hardware unit on Apple GPUs) division; Plummer softening keeps
+# r2 >= eps2 > 0 so no NaN/Inf can arise. Portable across all JACC backends.
+const UNROLL = 4
+
 function calc_acc!(i, x, y, z, m, ax, ay, az, eps2, N)
     T = eltype(ax)
     @inbounds xi = x[i]
     @inbounds yi = y[i]
     @inbounds zi = z[i]
-    axi = zero(T)
-    ayi = zero(T)
-    azi = zero(T)
-    @inbounds for j in 1:N
+    @nexprs 4 u -> axi_u = zero(T)
+    @nexprs 4 u -> ayi_u = zero(T)
+    @nexprs 4 u -> azi_u = zero(T)
+    Nround = N - (N % UNROLL)
+    j = 1
+    @inbounds @fastmath while j <= Nround
+        @nexprs 4 u -> begin
+            dx_u = x[j + u - 1] - xi
+            dy_u = y[j + u - 1] - yi
+            dz_u = z[j + u - 1] - zi
+            r2_u = eps2 + dx_u * dx_u + dy_u * dy_u + dz_u * dz_u
+            ri_u = inv(sqrt(r2_u))
+            alp_u = m[j + u - 1] * ri_u * ri_u * ri_u
+            axi_u += alp_u * dx_u
+            ayi_u += alp_u * dy_u
+            azi_u += alp_u * dz_u
+        end
+        j += UNROLL
+    end
+    # Tail for N not divisible by UNROLL.
+    @inbounds @fastmath while j <= N
         dx = x[j] - xi
         dy = y[j] - yi
         dz = z[j] - zi
         r2 = eps2 + dx * dx + dy * dy + dz * dz
         r_inv = inv(sqrt(r2))
         alp = m[j] * r_inv * r_inv * r_inv
-        axi += alp * dx
-        ayi += alp * dy
-        azi += alp * dz
+        axi_1 += alp * dx
+        ayi_1 += alp * dy
+        azi_1 += alp * dz
+        j += 1
     end
-    @inbounds ax[i] = axi
-    @inbounds ay[i] = ayi
-    @inbounds az[i] = azi
+    @inbounds ax[i] = (axi_1 + axi_2) + (axi_3 + axi_4)
+    @inbounds ay[i] = (ayi_1 + ayi_2) + (ayi_3 + ayi_4)
+    @inbounds az[i] = (azi_1 + azi_2) + (azi_3 + azi_4)
     return nothing
 end
 
-launch!(x, y, z, m, ax, ay, az, eps2, N) =
-    JACC.@parallel_for range=N calc_acc!(x, y, z, m, ax, ay, az, eps2, N)
+# Launch the force kernel. `tg === nothing` uses JACC's automatic launch
+# configuration (unchanged behaviour, all backends). A concrete `tg` pins the
+# threadgroup/block size via JACC's LaunchSpec path -- used by the GPU
+# autotune below to pick the size that maximises occupancy.
+launch!(x, y, z, m, ax, ay, az, eps2, N, tg) =
+    tg === nothing ?
+    JACC.@parallel_for(range=N, calc_acc!(x, y, z, m, ax, ay, az, eps2, N)) :
+    JACC.@parallel_for(range=N, threads=tg, blocks=cld(N, tg),
+        calc_acc!(x, y, z, m, ax, ay, az, eps2, N))
 
 # --- Initial conditions: uniform sphere (cf. nbody/cpp/common/init.hpp) ------
 function uniform_sphere(::Type{T}, N; Mtot = one(T), rad = one(T)) where {T}
@@ -104,7 +138,7 @@ function check_correctness(::Type{T}; N = 256) where {T}
 
     x = JACC.array(hx); y = JACC.array(hy); z = JACC.array(hz); m = JACC.array(hm)
     ax = JACC.zeros(T, N); ay = JACC.zeros(T, N); az = JACC.zeros(T, N)
-    launch!(x, y, z, m, ax, ay, az, eps2, N)
+    launch!(x, y, z, m, ax, ay, az, eps2, N, nothing)
     JACC.synchronize()
 
     gax = Array(ax); gay = Array(ay); gaz = Array(az)
@@ -122,14 +156,14 @@ function check_correctness(::Type{T}; N = 256) where {T}
 end
 
 # --- Benchmark one value of N ------------------------------------------------
-function bench_N(::Type{T}, N; min_elapsed = 0.5) where {T}
+function bench_N(::Type{T}, N, tg; min_elapsed = 0.5) where {T}
     eps2 = (T(1) / T(64))^2
     hx, hy, hz, hm = uniform_sphere(T, N)
     x = JACC.array(hx); y = JACC.array(hy); z = JACC.array(hz); m = JACC.array(hm)
     ax = JACC.zeros(T, N); ay = JACC.zeros(T, N); az = JACC.zeros(T, N)
 
     # Warm-up (triggers JIT compilation of the kernel).
-    launch!(x, y, z, m, ax, ay, az, eps2, N)
+    launch!(x, y, z, m, ax, ay, az, eps2, N, tg)
     JACC.synchronize()
 
     iter = 1
@@ -138,7 +172,7 @@ function bench_N(::Type{T}, N; min_elapsed = 0.5) where {T}
         JACC.synchronize()
         t0 = time_ns()
         for _ in 1:iter
-            launch!(x, y, z, m, ax, ay, az, eps2, N)
+            launch!(x, y, z, m, ax, ay, az, eps2, N, tg)
         end
         JACC.synchronize()
         elapsed = (time_ns() - t0) / 1e9
@@ -153,6 +187,39 @@ function bench_N(::Type{T}, N; min_elapsed = 0.5) where {T}
     return iter, elapsed, pairs_per_s, gflops
 end
 
+# --- GPU launch-config autotune ---------------------------------------------
+# JACC's default threadgroup size on Metal is the kernel maximum (1024), which
+# can limit occupancy for register-heavy kernels. Try a few sizes once and keep
+# the fastest. Returns `nothing` (= JACC's automatic config, unchanged
+# behaviour) on CPU backends, so portability is preserved.
+const TG_CANDIDATES = (64, 128, 256, 512, 1024)
+
+function autotune_tg(::Type{T}; N = 1 << 17, iters = 16) where {T}
+    JACC.array_type() === Base.Array && return nothing  # CPU: keep defaults
+    eps2 = (T(1) / T(64))^2
+    hx, hy, hz, hm = uniform_sphere(T, N)
+    x = JACC.array(hx); y = JACC.array(hy); z = JACC.array(hz); m = JACC.array(hm)
+    ax = JACC.zeros(T, N); ay = JACC.zeros(T, N); az = JACC.zeros(T, N)
+    best_tg = TG_CANDIDATES[1]
+    best_t = Inf
+    for tg in TG_CANDIDATES
+        tg > N && continue
+        launch!(x, y, z, m, ax, ay, az, eps2, N, tg)  # warm-up
+        JACC.synchronize()
+        t0 = time_ns()
+        for _ in 1:iters
+            launch!(x, y, z, m, ax, ay, az, eps2, N, tg)
+        end
+        JACC.synchronize()
+        t = (time_ns() - t0) / 1e9
+        if t < best_t
+            best_t = t
+            best_tg = tg
+        end
+    end
+    return best_tg
+end
+
 # --- Main --------------------------------------------------------------------
 function main()
     T = FP
@@ -160,10 +227,13 @@ function main()
     N_max  = length(ARGS) >= 2 ? parse(Int, ARGS[2]) : 1 << 20
     N_bins = length(ARGS) >= 3 ? parse(Int, ARGS[3]) : 11
 
+    tg = autotune_tg(T)
+
     println("JACC.jl N-body benchmark - direct all-pairs leapfrog force kernel")
     println("  backend array type : ", JACC.array_type())
     println("  CPU threads        : ", Threads.nthreads())
     println("  precision          : ", T)
+    println("  threadgroup size   : ", tg === nothing ? "auto (JACC default)" : tg)
     @printf("  N sweep            : %d .. %d (%d log-spaced points)\n",
         N_min, N_max, N_bins)
     println()
@@ -179,7 +249,7 @@ function main()
         "N", "iters", "time[s]", "interactions/s", "GFLOP/s")
     peak = 0.0
     for N in Ns
-        iter, elapsed, pairs_per_s, gflops = bench_N(T, N)
+        iter, elapsed, pairs_per_s, gflops = bench_N(T, N, tg)
         peak = max(peak, gflops)
         @printf("%12d %8d %12.4f %18.4e %12.3f\n",
             N, iter, elapsed, pairs_per_s, gflops)

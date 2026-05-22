@@ -66,10 +66,16 @@ julia --project -e 'import JACC; JACC.set_backend("threads")'
 
 - 実行時に小規模 (N=256) の正当性チェックを行い、ホスト側の素朴な逐次実装と
   相対 L2 誤差を比較する。
+- GPU バックエンドでは起動時に threadgroup サイズ（`{64,128,256,512,1024}`）を
+  軽量オートチューンし、最速の値をスイープ全体に採用する（ヘッダの
+  `threadgroup size` 行に表示）。CPU スレッドバックエンドではオートチューンを
+  skip し、JACC 既定の起動設定を用いる（`auto (JACC default)` と表示）。
 - N スイープの各点で、最小計測時間 (0.5 s) に達するまで反復回数を自動調整し、
   `interactions/s` と `GFLOP/s` を表形式で出力する。
 
 ```
+  threadgroup size   : 128
+  N sweep            : 1024 .. 1048576 (11 log-spaced points)
            N    iters      time[s]     interactions/s      GFLOP/s
         1024     2048       1.0448         2.0553e+09       49.328
         ...
