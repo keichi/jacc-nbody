@@ -1,9 +1,10 @@
 # Unroll-factor tuning sweep for the N-body force kernel.
 #
-# `@nexprs` needs a literal unroll count, so this script metaprograms one
-# `calc_acc_<U>` kernel + launcher per candidate U, then benchmarks each at a
-# fixed N (default 32768) and reports the fastest. Mirrors the kernel of
-# nbody_jacc.jl exactly apart from the parametric unroll factor.
+# `llvm.loop.unroll.count` loopinfo needs a literal unroll count, so this
+# script metaprograms one `calc_acc_<U>` kernel + launcher per candidate U,
+# then benchmarks each at a fixed N (default 32768) and reports the fastest.
+# Mirrors the kernel of nbody_jacc.jl exactly apart from the parametric
+# unroll factor.
 #
 # Usage:
 #   julia --project tune_unroll.jl [N]
@@ -13,12 +14,27 @@ import JACC
 JACC.@init_backend
 
 using Printf
-using Base.Cartesian: @nexprs, @ntuple
 
 const FP = get(ENV, "JACC_NBODY_FP", "32") == "64" ? Float64 : Float32
-const FLOPS_PER_INTERACTION = 24.0
+const FLOPS_PER_INTERACTION = 22.0
 const UNROLL_CANDIDATES = (1, 2, 4, 8, 16, 32)
 const TG_CANDIDATES = (64, 128, 256, 512, 1024)
+
+# Reciprocal-sqrt via the NVVM approx.ftz intrinsic (CUDA-only). Matches the
+# kernel in nbody_jacc.jl; swap with `inv(sqrt)` / `Metal.rsqrt_fast` for
+# other backends.
+@inline function rsqrt_ftz(x::Float32)
+    Base.llvmcall(
+        ("""
+         declare float @llvm.nvvm.rsqrt.approx.ftz.f(float)
+         define float @entry(float %0) #0 {
+           %r = call float @llvm.nvvm.rsqrt.approx.ftz.f(float %0)
+           ret float %r
+         }
+         attributes #0 = { alwaysinline }
+         """, "entry"),
+        Float32, Tuple{Float32}, x)
+end
 
 # --- Initial conditions: uniform sphere (cf. nbody_jacc.jl) ------------------
 function uniform_sphere(::Type{T}, N; Mtot = one(T), rad = one(T)) where {T}
@@ -66,38 +82,24 @@ for U in UNROLL_CANDIDATES
             @inbounds xi = x[i]
             @inbounds yi = y[i]
             @inbounds zi = z[i]
-            @nexprs $U u -> axi_u = zero(T)
-            @nexprs $U u -> ayi_u = zero(T)
-            @nexprs $U u -> azi_u = zero(T)
-            Nround = N - (N % $U)
-            @inbounds @fastmath for j in 1:$U:Nround
-                @nexprs $U u -> begin
-                    dx_u = x[j + u - 1] - xi
-                    dy_u = y[j + u - 1] - yi
-                    dz_u = z[j + u - 1] - zi
-                    r2_u = eps2 + dx_u * dx_u + dy_u * dy_u + dz_u * dz_u
-                    ri_u = inv(sqrt(r2_u))
-                    alp_u = m[j + u - 1] * ri_u * ri_u * ri_u
-                    axi_u += alp_u * dx_u
-                    ayi_u += alp_u * dy_u
-                    azi_u += alp_u * dz_u
-                end
-            end
-            # Tail for N not divisible by U.
-            @inbounds @fastmath for j in (Nround + 1):N
+            axi = zero(T)
+            ayi = zero(T)
+            azi = zero(T)
+            @inbounds @fastmath for j in 1:N
+                $(Expr(:loopinfo, (Symbol("llvm.loop.unroll.count"), U)))
                 dx = x[j] - xi
                 dy = y[j] - yi
                 dz = z[j] - zi
                 r2 = eps2 + dx * dx + dy * dy + dz * dz
-                r_inv = inv(sqrt(r2))
+                r_inv = rsqrt_ftz(r2)
                 alp = m[j] * r_inv * r_inv * r_inv
-                axi_1 += alp * dx
-                ayi_1 += alp * dy
-                azi_1 += alp * dz
+                axi += alp * dx
+                ayi += alp * dy
+                azi += alp * dz
             end
-            @inbounds ax[i] = sum(@ntuple $U axi)
-            @inbounds ay[i] = sum(@ntuple $U ayi)
-            @inbounds az[i] = sum(@ntuple $U azi)
+            @inbounds ax[i] = axi
+            @inbounds ay[i] = ayi
+            @inbounds az[i] = azi
             return nothing
         end
 

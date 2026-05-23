@@ -45,11 +45,14 @@ end
 # a_i = sum_j  m_j * (r_j - r_i) / (r_ji^2 + eps^2)^(3/2),  with G = 1.
 # The j == i term is kept (Plummer softening keeps it finite), matching the
 # reference's N_pairs = N^2 accounting.
-# The j loop is unrolled 8x via an `llvm.loop.unroll.count` loopinfo hint, so
+# The j loop is unrolled 16x via an `llvm.loop.unroll.count` loopinfo hint, so
 # consecutive interactions become independent and expose the instruction-level
 # parallelism the GPU needs to overlap reciprocal-sqrt latency. @fastmath
 # enables FMA contraction and reassociation; the reciprocal-sqrt itself comes
 # from the explicit `rsqrt_ftz` call below (NVVM intrinsic, CUDA-only).
+# 16x was picked by tune_unroll.jl on an RTX PRO 6000 Blackwell at N=32768.
+# Re-run that script to retune for other GPUs -- and keep the literal in the
+# `llvm.loop.unroll.count` loopinfo below in sync if you do.
 
 @eval function calc_acc!(i, x, y, z, m, ax, ay, az, eps2, N)
     T = eltype(ax)
@@ -60,7 +63,7 @@ end
     ayi = zero(T)
     azi = zero(T)
     @inbounds @fastmath for j in 1:N
-        $(Expr(:loopinfo, (Symbol("llvm.loop.unroll.count"), 8)))
+        $(Expr(:loopinfo, (Symbol("llvm.loop.unroll.count"), 16)))
         dx = x[j] - xi
         dy = y[j] - yi
         dz = z[j] - zi

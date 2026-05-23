@@ -85,10 +85,3 @@ julia --project -e 'import JACC; JACC.set_backend("threads")'
         ...
 peak performance: 54.217 GFLOP/s  (24 FLOP per interaction)
 ```
-
-## Files
-
-| File | Contents |
-|---|---|
-| `nbody_jacc.jl` | The benchmark itself (kernel, initial conditions, correctness check, sweep) |
-| `Project.toml` / `Manifest.toml` | Dependencies (`JACC`) |
