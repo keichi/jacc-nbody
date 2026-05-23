@@ -15,66 +15,68 @@ import JACC
 JACC.@init_backend
 
 using Printf
-using Base.Cartesian: @nexprs, @ntuple
+# using CUDA
+# using Metal
 
 # Floating-point type: Float32 (default) or Float64 via JACC_NBODY_FP=64
 const FP = get(ENV, "JACC_NBODY_FP", "32") == "64" ? Float64 : Float32
 
-# 24 floating-point operations per pairwise interaction (leapfrog, no potential),
+# 22 floating-point operations per pairwise interaction (leapfrog, no potential),
 # counting reciprocal-sqrt as 4 ops -- same convention as the reference repo.
-const FLOPS_PER_INTERACTION = 24.0
+const FLOPS_PER_INTERACTION = 22.0
+
+# Reciprocal-sqrt via the NVVM approx.ftz intrinsic (flush-to-zero, ~22-bit
+# accuracy). CUDA-only -- on other backends, swap in one of the alternatives
+# commented out in the kernel below (`inv(sqrt)`, `Metal.rsqrt_fast`, ...).
+@inline function rsqrt_ftz(x::Float32)
+    Base.llvmcall(
+        ("""
+         declare float @llvm.nvvm.rsqrt.approx.ftz.f(float)
+         define float @entry(float %0) #0 {
+           %r = call float @llvm.nvvm.rsqrt.approx.ftz.f(float %0)
+           ret float %r
+         }
+         attributes #0 = { alwaysinline }
+         """, "entry"),
+        Float32, Tuple{Float32}, x)
+end
 
 # --- Force kernel: direct all-pairs gravitational acceleration --------------
 # a_i = sum_j  m_j * (r_j - r_i) / (r_ji^2 + eps^2)^(3/2),  with G = 1.
 # The j == i term is kept (Plummer softening keeps it finite), matching the
 # reference's N_pairs = N^2 accounting.
-# The j loop is unrolled 8x with independent partial accumulators (suffixes
-# _1.._8): consecutive interactions become independent, exposing the
-# instruction-level parallelism the GPU needs to overlap reciprocal-sqrt
-# latency. @fastmath fuses 1/sqrt into a fast reciprocal-sqrt and drops the
-# (slow, no hardware unit on Apple GPUs) division; Plummer softening keeps
-# r2 >= eps2 > 0 so no NaN/Inf can arise. Portable across all JACC backends.
-# 8x was picked by tune_unroll.jl: peak GFLOP/s on Metal at N=32768, with a
-# sharp drop beyond (register pressure). Re-run that script to retune -- and
-# keep the literal 8 in `@nexprs` and `N % 8` below in sync if you do.
+# The j loop is unrolled 8x via an `llvm.loop.unroll.count` loopinfo hint, so
+# consecutive interactions become independent and expose the instruction-level
+# parallelism the GPU needs to overlap reciprocal-sqrt latency. @fastmath
+# enables FMA contraction and reassociation; the reciprocal-sqrt itself comes
+# from the explicit `rsqrt_ftz` call below (NVVM intrinsic, CUDA-only).
 
-function calc_acc!(i, x, y, z, m, ax, ay, az, eps2, N)
+@eval function calc_acc!(i, x, y, z, m, ax, ay, az, eps2, N)
     T = eltype(ax)
     @inbounds xi = x[i]
     @inbounds yi = y[i]
     @inbounds zi = z[i]
-    @nexprs 8 u -> axi_u = zero(T)
-    @nexprs 8 u -> ayi_u = zero(T)
-    @nexprs 8 u -> azi_u = zero(T)
-    Nround = N - (N % 8)
-    @inbounds @fastmath for j in 1:8:Nround
-        @nexprs 8 u -> begin
-            dx_u = x[j + u - 1] - xi
-            dy_u = y[j + u - 1] - yi
-            dz_u = z[j + u - 1] - zi
-            r2_u = eps2 + dx_u * dx_u + dy_u * dy_u + dz_u * dz_u
-            ri_u = inv(sqrt(r2_u))
-            alp_u = m[j + u - 1] * ri_u * ri_u * ri_u
-            axi_u += alp_u * dx_u
-            ayi_u += alp_u * dy_u
-            azi_u += alp_u * dz_u
-        end
-    end
-    # Tail for N not divisible by 8.
-    @inbounds @fastmath for j in (Nround + 1):N
+    axi = zero(T)
+    ayi = zero(T)
+    azi = zero(T)
+    @inbounds @fastmath for j in 1:N
+        $(Expr(:loopinfo, (Symbol("llvm.loop.unroll.count"), 8)))
         dx = x[j] - xi
         dy = y[j] - yi
         dz = z[j] - zi
         r2 = eps2 + dx * dx + dy * dy + dz * dz
-        r_inv = inv(sqrt(r2))
+        # r_inv = inv(sqrt(r2))
+        # r_inv = Metal.rsqrt_fast(r2)
+        # r_inv = CUDA.rsqrt(r2)
+        r_inv = rsqrt_ftz(r2)
         alp = m[j] * r_inv * r_inv * r_inv
-        axi_1 += alp * dx
-        ayi_1 += alp * dy
-        azi_1 += alp * dz
+        axi += alp * dx
+        ayi += alp * dy
+        azi += alp * dz
     end
-    @inbounds ax[i] = sum(@ntuple 8 axi)
-    @inbounds ay[i] = sum(@ntuple 8 ayi)
-    @inbounds az[i] = sum(@ntuple 8 azi)
+    @inbounds ax[i] = axi
+    @inbounds ay[i] = ayi
+    @inbounds az[i] = azi
     return nothing
 end
 
