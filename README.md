@@ -1,9 +1,7 @@
 # JACC.jl N-body Benchmark
 
 A force-kernel benchmark for the N-body problem (direct all-pairs method)
-using [JACC.jl](https://github.com/JuliaGPU/JACC.jl). It runs on any of the
-CPU threads / CUDA / AMDGPU / Metal / oneAPI backends **from a single source**.
-
+using [JACC.jl](https://github.com/JuliaGPU/JACC.jl).
 The kernel is based on the `calc_acc` acceleration computation of the
 2nd-order leapfrog, direct all-pairs (O(N²)) scheme from
 [ymiki-repo/nbody](https://github.com/ymiki-repo/nbody). Following that
@@ -15,7 +13,7 @@ the force (acceleration) kernel alone** while varying N.
 - Acceleration: `a_i = Σ_j m_j (r_j - r_i) / (r_ji² + ε²)^{3/2}`, gravitational constant `G = 1`
 - Plummer softening: `ε = 1/64`
 - Initial conditions: uniform sphere (radius 1, total mass 1, equal-mass particles)
-- **24 FLOP** per interaction (the reciprocal-sqrt is counted as 4 FLOP)
+- **22 FLOP** per interaction (the reciprocal-sqrt is counted as 4 FLOP)
 - Data layout: SoA (positions `x,y,z`, mass `m`, accelerations `ax,ay,az` in separate arrays)
 
 ## Requirements
@@ -78,10 +76,19 @@ julia --project -e 'import JACC; JACC.set_backend("threads")'
   `interactions/s` and `GFLOP/s` are printed in tabular form.
 
 ```
-  threadgroup size   : 128
+JACC.jl N-body benchmark - direct all-pairs leapfrog force kernel
+  backend array type : CUDACore.CuArray
+  CPU threads        : 1
+  precision          : Float32
+  threadgroup size   : 256
   N sweep            : 1024 .. 1048576 (11 log-spaced points)
+
+correctness check: N=256, relative L2 error = 1.884e-07 (tol 1e-03)
+
            N    iters      time[s]     interactions/s      GFLOP/s
-        1024     2048       1.0448         2.0553e+09       49.328
+        1024     8192       0.7907         1.0863e+10      238.990
+        2048     4096       0.7396         2.3229e+10      511.032
         ...
-peak performance: 54.217 GFLOP/s  (24 FLOP per interaction)
+      524288        2       0.8489         6.4764e+11    14247.973
+     1048576        1       1.6725         6.5739e+11    14462.601
 ```
