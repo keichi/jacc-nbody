@@ -25,34 +25,85 @@ const FP = get(ENV, "JACC_NBODY_FP", "32") == "64" ? Float64 : Float32
 # counting reciprocal-sqrt as 4 ops -- same convention as the reference repo.
 const FLOPS_PER_INTERACTION = 22.0
 
-# Reciprocal-sqrt via the NVVM approx.ftz intrinsic (flush-to-zero, ~22-bit
-# accuracy). CUDA-only -- on other backends, swap in one of the alternatives
-# commented out in the kernel below (`inv(sqrt)`, `Metal.rsqrt_fast`, ...).
-@inline function rsqrt_ftz(x::Float32)
-    Base.llvmcall(
-        ("""
-         declare float @llvm.nvvm.rsqrt.approx.ftz.f(float)
-         define float @entry(float %0) #0 {
-           %r = call float @llvm.nvvm.rsqrt.approx.ftz.f(float %0)
-           ret float %r
-         }
-         attributes #0 = { alwaysinline }
-         """, "entry"),
-        Float32, Tuple{Float32}, x)
+# --- Reciprocal square root: backend-specific implementation ----------------
+# JACC compiles the force kernel once for the backend selected via
+# `JACC.set_backend(...)`, so the reciprocal-sqrt implementation is chosen at
+# load time from the active backend (`JACC.backend`) with `@static if`. Only the
+# selected branch is parsed, so backend packages (CUDA/AMDGPU) need not be
+# available for the other branches.
+#
+#   Threads      : @fastmath inv(sqrt(x))                    (host FP)
+#   CUDA         : NVVM rsqrt.approx.ftz (Float32) / CUDA.rsqrt (Float64)
+#   AMDGPU       : amdgcn.rsq.f32 (Float32) / AMDGPU.Device.rsqrt (Float64)
+#   VectorEngine : @fastmath seed + Newton-Raphson refinement
+#                  (1 pass -> full Float32, 2 passes -> full Float64)
+const JACC_BACKEND = Symbol(lowercase(string(JACC.backend)))
+
+@static if JACC_BACKEND === :cuda
+    # Reciprocal-sqrt via the NVVM approx.ftz intrinsic (flush-to-zero, ~22-bit
+    # accuracy).
+    @inline function rsqrt(x::Float32)
+        Base.llvmcall(
+            ("""
+             declare float @llvm.nvvm.rsqrt.approx.ftz.f(float)
+             define float @entry(float %0) #0 {
+               %r = call float @llvm.nvvm.rsqrt.approx.ftz.f(float %0)
+               ret float %r
+             }
+             attributes #0 = { alwaysinline }
+             """, "entry"),
+            Float32, Tuple{Float32}, x)
+    end
+    @inline rsqrt(x::Float64) = CUDA.rsqrt(x)
+
+elseif JACC_BACKEND === :amdgpu
+    # Reciprocal-sqrt via the AMDGCN hardware intrinsic.
+    @inline function rsqrt(x::Float32)
+        Base.llvmcall(
+            ("""
+             declare float @llvm.amdgcn.rsq.f32(float)
+             define float @entry(float %0) #0 {
+               %r = call float @llvm.amdgcn.rsq.f32(float %0)
+               ret float %r
+             }
+             attributes #0 = { alwaysinline }
+             """, "entry"),
+            Float32, Tuple{Float32}, x)
+    end
+    @inline rsqrt(x::Float64) = AMDGPU.Device.rsqrt(x)
+
+elseif JACC_BACKEND === :vectorengine
+    # Hardware reciprocal-sqrt seed refined with Newton-Raphson iterations:
+    # one pass reaches full Float32 accuracy, two passes full Float64.
+    @inline function rsqrt(x::Float32)
+        y = @fastmath 1.0f0 / sqrt(x)         # 1 op
+        y += 0.5f0 * y * (1.0f0 - x * y * y)  # 6 ops
+        return y
+    end
+    @inline function rsqrt(x::Float64)
+        y = @fastmath 1.0 / sqrt(x)       # 1 op
+        y += 0.5 * y * (1.0 - x * y * y)  # 6 ops
+        y += 0.5 * y * (1.0 - x * y * y)  # 6 ops
+        return y
+    end
+
+else  # :threads (and any other CPU backend)
+    @inline rsqrt(x::Union{Float32, Float64}) = @fastmath one(x) / sqrt(x)
 end
 
 # --- Force kernel: direct all-pairs gravitational acceleration --------------
 # a_i = sum_j  m_j * (r_j - r_i) / (r_ji^2 + eps^2)^(3/2),  with G = 1.
 # The j == i term is kept (Plummer softening keeps it finite), matching the
 # reference's N_pairs = N^2 accounting.
-# The j loop is unrolled 16x via an `llvm.loop.unroll.count` loopinfo hint, so
+# The j loop is unrolled 128x via an `llvm.loop.unroll.count` loopinfo hint, so
 # consecutive interactions become independent and expose the instruction-level
 # parallelism the GPU needs to overlap reciprocal-sqrt latency. @fastmath
 # enables FMA contraction and reassociation; the reciprocal-sqrt itself comes
-# from the explicit `rsqrt_ftz` call below (NVVM intrinsic, CUDA-only).
-# 16x was picked by tune_unroll.jl on an RTX PRO 6000 Blackwell at N=32768.
-# Re-run that script to retune for other GPUs -- and keep the literal in the
-# `llvm.loop.unroll.count` loopinfo below in sync if you do.
+# from the explicit `rsqrt` call below, dispatched per backend (see above).
+# 128x was picked by tune_unroll.jl on an AMD Instinct MI300A (gfx942) at
+# N=524288, where FP32 throughput saturates (128x and 256x tie; 64x is ~8%
+# slower). Re-run that script to retune for other GPUs -- and keep the literal
+# in the `llvm.loop.unroll.count` loopinfo below in sync if you do.
 
 @eval function calc_acc!(i, x, y, z, m, ax, ay, az, eps2, N)
     T = eltype(ax)
@@ -63,15 +114,12 @@ end
     ayi = zero(T)
     azi = zero(T)
     @inbounds @fastmath for j in 1:N
-        $(Expr(:loopinfo, (Symbol("llvm.loop.unroll.count"), 16)))
+        $(Expr(:loopinfo, (Symbol("llvm.loop.unroll.count"), 128)))
         dx = x[j] - xi
         dy = y[j] - yi
         dz = z[j] - zi
         r2 = eps2 + dx * dx + dy * dy + dz * dz
-        # r_inv = inv(sqrt(r2))
-        # r_inv = Metal.rsqrt_fast(r2)
-        # r_inv = CUDA.rsqrt(r2)
-        r_inv = rsqrt_ftz(r2)
+        r_inv = rsqrt(r2)
         alp = m[j] * r_inv * r_inv * r_inv
         axi += alp * dx
         ayi += alp * dy
