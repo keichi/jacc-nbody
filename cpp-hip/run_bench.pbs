@@ -1,0 +1,33 @@
+#!/bin/bash
+#PBS -q debug
+#PBS -A INSITU
+#PBS -l select=1
+#PBS -l walltime=00:30:00
+#PBS -N nbody-hip-bench
+#PBS -j oe
+#PBS -o hip_bench.out
+
+# Run the hipified ymiki-repo/nbody force kernel benchmark on one MI300A.
+# Sweep matches the JACC.jl benchmark: N = 1024 .. 2^20, 11 log-spaced points,
+# minimum measurement time 0.5 s per point.
+
+cd "$PBS_O_WORKDIR"
+source /etc/profile.d/modules.sh
+module load rocm/7.2.0
+
+BIN="build"
+
+echo "=== host: $(hostname)  date: $(date) ==="
+rocminfo 2>/dev/null | grep -m1 "Marketing Name" || rocminfo 2>/dev/null | grep -m1 gfx
+echo "sweep: N=1024..1048576, 11 points, min 0.5s (matches JACC.jl bench)"
+mkdir -p log
+
+for prec in fp32 mixed fp64; do
+  echo
+  echo "############## $prec ##############"
+  rm -f log/collapse_run.csv
+  ./${BIN}/nbody_bench_${prec} --num_min 1024 --num_max 1048576 --num_bin 11 --elapse_min 0.5
+  echo "--- log/collapse_run.csv ---"
+  cat log/collapse_run.csv
+done
+echo "=== done: $(date) ==="
