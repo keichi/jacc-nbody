@@ -75,20 +75,32 @@ julia --project -e 'import JACC; JACC.set_backend("threads")'
   adjusted until the minimum measurement time (0.5 s) is reached, and
   `interactions/s` and `GFLOP/s` are printed in tabular form.
 
+Example output on an **AMD Instinct MI300A** (`gfx942`, ROCm 7.2.0,
+AMDGPU.jl 2.5.1; loop unrolled 128x, tuned with `tune_unroll.jl` at N=524288):
+
 ```
 JACC.jl N-body benchmark - direct all-pairs leapfrog force kernel
-  backend array type : CUDACore.CuArray
+  backend array type : AMDGPU.ROCArray
   CPU threads        : 1
   precision          : Float32
-  threadgroup size   : 256
+  threadgroup size   : 1024
   N sweep            : 1024 .. 1048576 (11 log-spaced points)
 
-correctness check: N=256, relative L2 error = 1.884e-07 (tol 1e-03)
+correctness check: N=256, relative L2 error = 1.102e-07 (tol 1e-03)
 
            N    iters      time[s]     interactions/s      GFLOP/s
-        1024     8192       0.7907         1.0863e+10      238.990
-        2048     4096       0.7396         2.3229e+10      511.032
-        ...
-      524288        2       0.8489         6.4764e+11    14247.973
-     1048576        1       1.6725         6.5739e+11    14462.601
+        1024     4096       0.5084         8.4474e+09      185.842
+       32768      256       0.9356         2.9379e+11     6463.320
+      131072       64       0.9499         1.1575e+12    25464.078
+      524288        4       0.7715         1.4251e+12    31352.894
+     1048576        1       0.6567         1.6744e+12    36835.766
+
+peak performance: 36835.766 GFLOP/s  (22 FLOP per interaction)
 ```
+
+Peak throughput on the MI300A (11-point sweep, N up to 2^20):
+
+| precision | peak GFLOP/s | at N     |
+|-----------|-------------:|---------:|
+| Float32   |     36835.8  | 1048576  |
+| Float64   |     20824.6  | 1048576  |

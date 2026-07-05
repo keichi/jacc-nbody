@@ -1,0 +1,20 @@
+#!/bin/bash
+#PBS -q debug
+#PBS -A INSITU
+#PBS -l select=1
+#PBS -l walltime=00:30:00
+#PBS -N nbody-tune
+#PBS -j oe
+#PBS -o tune.out
+
+cd "$PBS_O_WORKDIR"
+source /etc/profile.d/modules.sh
+module load rocm/7.2.0
+export PATH=$HOME/.juliaup/bin:$PATH
+
+echo "=== host: $(hostname)  date: $(date) ==="
+echo "=== rocminfo (gfx) ==="
+rocminfo 2>/dev/null | grep -m1 gfx || echo "rocminfo unavailable"
+echo "=== tune_unroll (FP32), N=${NBODY_TUNE_N:-32768} ==="
+julia --project tune_unroll.jl "${NBODY_TUNE_N:-32768}"
+echo "=== done: $(date) ==="

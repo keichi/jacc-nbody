@@ -17,23 +17,46 @@ using Printf
 
 const FP = get(ENV, "JACC_NBODY_FP", "32") == "64" ? Float64 : Float32
 const FLOPS_PER_INTERACTION = 22.0
-const UNROLL_CANDIDATES = (1, 2, 4, 8, 16, 32)
+const UNROLL_CANDIDATES = (1, 2, 4, 8, 16, 32, 64, 128, 256)
 const TG_CANDIDATES = (64, 128, 256, 512, 1024)
 
-# Reciprocal-sqrt via the NVVM approx.ftz intrinsic (CUDA-only). Matches the
-# kernel in nbody_jacc.jl; swap with `inv(sqrt)` / `Metal.rsqrt_fast` for
-# other backends.
-@inline function rsqrt_ftz(x::Float32)
-    Base.llvmcall(
-        ("""
-         declare float @llvm.nvvm.rsqrt.approx.ftz.f(float)
-         define float @entry(float %0) #0 {
-           %r = call float @llvm.nvvm.rsqrt.approx.ftz.f(float %0)
-           ret float %r
-         }
-         attributes #0 = { alwaysinline }
-         """, "entry"),
-        Float32, Tuple{Float32}, x)
+# Reciprocal square root, chosen per active backend (mirrors nbody_jacc.jl).
+# `@static if` parses only the selected branch, so backend packages need not be
+# available for the others.
+const JACC_BACKEND = Symbol(lowercase(string(JACC.backend)))
+
+@static if JACC_BACKEND === :cuda
+    @inline function rsqrt(x::Float32)
+        Base.llvmcall(
+            ("""
+             declare float @llvm.nvvm.rsqrt.approx.ftz.f(float)
+             define float @entry(float %0) #0 {
+               %r = call float @llvm.nvvm.rsqrt.approx.ftz.f(float %0)
+               ret float %r
+             }
+             attributes #0 = { alwaysinline }
+             """, "entry"),
+            Float32, Tuple{Float32}, x)
+    end
+    @inline rsqrt(x::Float64) = CUDA.rsqrt(x)
+
+elseif JACC_BACKEND === :amdgpu
+    @inline function rsqrt(x::Float32)
+        Base.llvmcall(
+            ("""
+             declare float @llvm.amdgcn.rsq.f32(float)
+             define float @entry(float %0) #0 {
+               %r = call float @llvm.amdgcn.rsq.f32(float %0)
+               ret float %r
+             }
+             attributes #0 = { alwaysinline }
+             """, "entry"),
+            Float32, Tuple{Float32}, x)
+    end
+    @inline rsqrt(x::Float64) = AMDGPU.Device.rsqrt(x)
+
+else  # threads / vectorengine / other CPU backends
+    @inline rsqrt(x::Union{Float32, Float64}) = @fastmath one(x) / sqrt(x)
 end
 
 # --- Initial conditions: uniform sphere (cf. nbody_jacc.jl) ------------------
@@ -91,7 +114,7 @@ for U in UNROLL_CANDIDATES
                 dy = y[j] - yi
                 dz = z[j] - zi
                 r2 = eps2 + dx * dx + dy * dy + dz * dz
-                r_inv = rsqrt_ftz(r2)
+                r_inv = rsqrt(r2)
                 alp = m[j] * r_inv * r_inv * r_inv
                 axi += alp * dx
                 ayi += alp * dy

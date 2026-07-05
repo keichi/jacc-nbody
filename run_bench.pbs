@@ -1,0 +1,24 @@
+#!/bin/bash
+#PBS -q debug
+#PBS -A INSITU
+#PBS -l select=1
+#PBS -l walltime=00:30:00
+#PBS -N nbody-bench
+#PBS -j oe
+#PBS -o bench.out
+
+cd "$PBS_O_WORKDIR"
+source /etc/profile.d/modules.sh
+module load rocm/7.2.0
+export PATH=$HOME/.juliaup/bin:$PATH
+
+echo "=== host: $(hostname)  date: $(date) ==="
+echo "=== unroll literal in nbody_jacc.jl ==="
+grep -n "llvm.loop.unroll.count" nbody_jacc.jl
+echo
+echo "############## FP32 ##############"
+JACC_NBODY_FP=32 julia --project nbody_jacc.jl
+echo
+echo "############## FP64 ##############"
+JACC_NBODY_FP=64 julia --project nbody_jacc.jl
+echo "=== done: $(date) ==="
